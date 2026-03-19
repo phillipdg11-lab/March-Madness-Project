@@ -1,0 +1,344 @@
+---
+title: "MM2026Pred_F"
+author: "Phillip DeGroot"
+date: "2026-03-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Installing packages 
+```{r}
+library(BradleyTerry2)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+```
+
+```{r}
+matchups = read.csv("2026_Potential_Matchups.csv")
+```
+
+
+#Get Kenpom data for 68 Tourney teams from https://www.formulabot.com/datasets/kenpom-march-madness
+```{r}
+kenpom_all = read_excel("kenpom_2000_2026.xlsx")
+
+tourney_teams = c("Akron", "Alabama", "Arizona", "Arkansas", "BYU", "Cal Baptist",
+  "Clemson", "Connecticut", "Duke", "Florida", "Furman", "Georgia", "Gonzaga",
+  "Hawaii", "High Point", "Hofstra", "Houston", "Howard", "Idaho", "Illinois",
+  "Iowa", "Iowa St.", "Kansas", "Kennesaw St.", "Kentucky", "LIU", "Lehigh",
+  "Louisville", "McNeese", "Miami FL", "Miami OH", "Michigan", "Michigan St.",
+  "Missouri", "North Dakota St.", "N.C. State", "Nebraska", "North Carolina",
+  "Northern Iowa", "Ohio St.", "Penn", "Prairie View A&M", "Purdue", "Queens",
+  "SMU", "Santa Clara", "Siena", "South Florida", "St. John's", "Saint Louis",
+  "Saint Mary's", "TCU", "Tennessee", "Tennessee St.", "Texas", "Texas A&M",
+  "Texas Tech", "Troy", "UCF", "UCLA", "UMBC", "Utah St.", "VCU", "Vanderbilt",
+  "Villanova", "Virginia", "Wisconsin", "Wright St.")
+
+kenpom = kenpom_all |>
+  filter(Year == 2026) |>
+  filter(TeamName %in% tourney_teams)
+
+kenpom
+```
+#Checking for mismached names
+```{r}
+csv_teams = unique(c(matchups$HigherSeed, matchups$LowerSeed))
+setdiff(csv_teams, kenpom$TeamName)
+```
+
+#Change Kenpom data so names match matchup csv
+```{r}
+name_map <- c(
+  "Iowa St."           = "Iowa St",
+  "Michigan St."       = "Michigan St",
+  "Ohio St."           = "Ohio St",
+  "Utah St."           = "Utah St",
+  "Wright St."         = "Wright St",
+  "N.C. State"         = "NC State",
+  "McNeese"            = "McNeese St",
+  "Tennessee St."      = "Tennessee St",
+  "St. John's"         = "St John's",
+  "Saint Louis"        = "St Louis",
+  "Saint Mary's"       = "St Mary's CA",
+  "North Dakota St."   = "N Dakota St",
+  "Prairie View A&M"   = "Prairie View",
+  "Queens"             = "Queens NC",
+  "LIU"                = "LIU Brooklyn",
+  "Kennesaw St."       = "Kennesaw"
+)
+
+for (kp_name in names(name_map)) {
+  kenpom$TeamName[kenpom$TeamName == kp_name] <- name_map[kp_name]
+}
+```
+
+#Verify for loop 
+```{r}
+setdiff(csv_teams, kenpom$TeamName)
+```
+
+
+#Plot of teams efficiency score
+```{r}
+ggplot(kenpom, aes(x = reorder(TeamName, AdjEM), y = AdjEM)) +
+  geom_col(aes(fill = AdjEM)) + 
+  labs(x = NULL, y = "Kenpom Adjusted Efficency Scores", title = "Kenpom AdjEM for Tourney Teams") 
+```
+#Creates a Strength Score that values "average" efficency. Takes from "trapizoid of excellence" idea that teams with a very high or low pace of play need to be "better" at their craft to see success in March Madness. 
+```{r}
+mean_tempo = mean(kenpom$AdjTempo)
+
+z = function(x) (x - mean(x)) / sd(x)
+
+kenpom$z_AdjEM = z(kenpom$AdjEM)
+kenpom$z_AdjDE = z(-kenpom$AdjDE)
+kenpom$z_AdjOE = z(kenpom$AdjOE)
+kenpom$z_Tempo = z(-abs(kenpom$AdjTempo - mean_tempo))
+
+#Creates a composite score that gives highest value towards effiency metrics 
+kenpom$composite = 0.65 * kenpom$z_AdjEM + 0.15 * kenpom$z_AdjDE + 0.15 * kenpom$z_AdjOE + 0.05 * kenpom$z_Tempo
+
+#Sanity Check
+
+kenpom |>
+  arrange(desc(composite))
+```
+
+#Find Sigma for Logistic Model  
+```{r}
+historical = kenpom_all |>
+  filter(!is.na(seed)) |>
+  filter(Year < 2026)
+
+#finds historical difference in em for higher seeds
+
+em_diffs = historical |>
+  group_by(Year, seed) |>
+  summarise(mean_em = mean(AdjEM), .groups = "drop") |>
+  filter(seed <= 8) |>
+  mutate(opp_seed = 17 - seed) |>
+  left_join(
+    historical |>
+      group_by(Year, seed) |>
+      summarise(opp_em = mean(AdjEM), .groups = "drop"), 
+    by = c("Year", "opp_seed" = "seed")
+  ) |>
+  mutate(em_gap = mean_em - opp_em) |>
+  group_by(seed) |>
+  summarise(avg_em_diff = mean(em_gap), .groups = "drop") |>
+  arrange(seed)
+
+em_diffs
+
+
+#historical win rates from higher seeds from https://www.fanduel.com/research/what-are-the-odds-of-a-perfect-march-madness-ncaa-tournament-bracket 
+
+historical_winpc = c(
+  0.988, # 1 vs 16
+  0.931, # 2 vs 15
+  0.856, # 3 vs 14
+  0.794, # 4 vs 13
+  0.644, # 5 vs 12
+  0.613, # 6 vs 11
+  0.613, # 7 vs 10
+  0.481 # 8 vs 9
+)
+
+sigmas = seq(0, 25, by = 0.01)
+sse = sapply(sigmas, function(s) {
+  predicted = 1 / (1 + 10^(-em_diffs / s))
+  sum((predicted - historical_winpc)^2)
+})
+
+sigma = as.numeric(unlist(sigmas[which.min(sse)]))
+
+# Sanity check
+
+sigma
+```
+
+#Fitting Logistic model to find win% against average 
+```{r}
+em_scale = sd(kenpom$AdjEM)
+kenpom$em_equiv = kenpom$composite * em_scale
+kenpom$p_avg = 1 / (1 + 10^(-kenpom$em_equiv / sigma))
+
+kenpom |>
+  arrange(desc(p_avg))
+```
+
+#Gets Log5 h2h probabilites 
+```{r}
+log5 = function(pA, pB) (pA- pA * pB) / (pA + pB - 2 * pA *pB)
+
+teams = unique(kenpom$TeamName)
+p_look = setNames(kenpom$p_avg, teams) #lookup function
+
+pairs = expand.grid(t1 = teams, t2 = teams, stringsAsFactors = FALSE) |>
+  filter(t1 < t2)
+pairs$prob1 = log5(p_look[pairs$t1], p_look[pairs$t2])
+
+set.seed(02222025)
+n_sim = 1000
+pairs$w1 = rbinom(nrow(pairs), n_sim, pairs$prob1)
+pairs$w2 = n_sim - pairs$w1
+```
+
+#Bradley Terry Model
+```{r}
+teams_sorted = sort(teams)
+bt = data.frame(
+  player1 = factor(pairs$t1, levels = teams_sorted),
+  player2 = factor(pairs$t2, levels = teams_sorted),
+  wins1 = pairs$w1, wins2 = pairs$w2
+)
+
+bt_model = BTm(cbind(wins1, wins2), player1, player2, data = bt)
+
+bt_model
+```
+
+```{r}
+ability = BTabilities(bt_model)
+
+adf = data.frame(
+  team = rownames(ability), ability = ability[, "ability"], se = ability[, "s.e."], stringsAsFactors = FALSE
+) 
+
+adf |>
+  arrange(desc(ability))
+```
+
+#Ability CI plot
+```{r}
+ggplot(adf, aes(x = reorder(team, ability), y = ability)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = ability - 1.96 * se, ymax = ability + 1.96 * se)) +
+  labs(X = NULL, y = "BT Ability", title = "BT Abilities of MM field")
+```
+
+
+#Predictions
+```{r}
+abl = setNames(adf$ability, adf$team)
+
+matchups$Predictions = round(
+  exp(abl[matchups$HigherSeed]) / 
+    (exp(abl[matchups$HigherSeed]) + exp(abl[matchups$LowerSeed])),
+  4
+)
+
+out = matchups |>
+  select(HigherSeed, HigherSeedID, HigherSeedNum, LowerSeed, LowerSeedID, LowerSeedNum, Predictions)
+write.csv(out, "Phil_D_2026_MM_Pred.csv", row.names = FALSE)
+```
+
+#Simulating the 2026 Bracket and picking the team with higher win%
+
+```{r}
+pick = function(a, b) {
+  la = abl[a]; lb <- abl[b]
+  pa = exp(la) / (exp(la) + exp(lb))
+  if (pa >= 0.5) list(w = a, p = round(pa, 3)) else list(w = b, p = round(1 - pa, 3))
+}
+
+#First Four
+ff = list(
+  list("NC State", "Texas", "11E"),       
+  list("SMU", "Miami OH", "11MW"),        
+  list("Prairie View", "Lehigh", "16S"),   
+  list("Howard", "UMBC", "16MW")           
+)
+ffw = list()
+for (g in ff) {
+  r = pick(g[[1]], g[[2]])
+  ffw[[g[[3]]]] = r$w
+  cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", g[[1]], g[[2]], r$w, r$p * 100))
+}
+```
+
+#Region Brackets
+```{r}
+East = c("Duke","Siena", "Ohio St","TCU",
+           "St John's","Northern Iowa", "Kansas","Cal Baptist",
+           "Louisville",ffw[["11E"]], "Michigan St","N Dakota St",
+           "UCLA","UCF", "Connecticut","Furman")
+
+South = c("Florida",ffw[["16S"]], "Clemson","Iowa",
+            "Vanderbilt","McNeese St", "Nebraska","Troy",
+            "North Carolina","VCU", "Illinois","Penn",
+            "St Mary's CA","Texas A&M", "Houston","Idaho")
+
+Midwest = c("Michigan",ffw[["16MW"]], "Georgia","St Louis",
+              "Texas Tech","Akron", "Alabama","Hofstra",
+              "Tennessee",ffw[["11MW"]], "Virginia","Kennesaw",
+              "Kentucky","Santa Clara", "Iowa St","Tennessee St")
+
+West = c("Arizona","LIU Brooklyn", "Villanova","Utah St",
+           "Wisconsin","High Point", "Arkansas","Hawaii",
+           "BYU","South Florida", "Gonzaga","Wright St",
+           "Miami FL","Missouri", "Purdue","Queens NC")
+
+```
+
+#Region Sims
+```{r}
+sim_region = function(t16, rname) {
+
+  cat("-- Round of 64 --\n")
+  w64 = character(8)
+  for (i in 1:8) {
+    a = t16[2*i - 1]; b = t16[2*i]
+    r = pick(a, b); w64[i] = r$w
+    cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", a, b, r$w, r$p * 100))
+  }
+
+  cat("-- Round of 32 --\n")
+  w32 = character(4)
+  for (i in 1:4) {
+    r = pick(w64[2*i-1], w64[2*i]); w32[i] = r$w
+    cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", w64[2*i-1], w64[2*i], r$w, r$p*100))
+  }
+
+  cat("-- Sweet 16 --\n")
+  w16 = character(2)
+  for (i in 1:2) {
+    r = pick(w32[2*i-1], w32[2*i]); w16[i] = r$w
+    cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", w32[2*i-1], w32[2*i], r$w, r$p*100))
+  }
+
+  cat("-- Elite Eight --\n")
+  r = pick(w16[1], w16[2])
+  cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", w16[1], w16[2], r$w, r$p*100))
+  return(r$w)
+}
+
+e_champ  = sim_region(East, "East")
+s_champ  = sim_region(South, "South")
+mw_champ = sim_region(Midwest, "Midwest")
+w_champ  = sim_region(West, "West")
+```
+
+#Final Four
+```{r}
+cat("-- Semifinal 1: East vs South --\n")
+r1 = pick(e_champ, s_champ)
+cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", e_champ, s_champ, r1$w, r1$p * 100))
+
+cat("-- Semifinal 2: West vs Midwest --\n")
+r2 = pick(w_champ, mw_champ)
+cat(sprintf("  %s vs %s -> %s (%.1f%%)\n", w_champ, mw_champ, r2$w, r2$p * 100))
+
+cat("\n========== NATIONAL CHAMPIONSHIP ==========\n")
+rf = pick(r1$w, r2$w)
+cat(sprintf("  %s vs %s -> %s WINS! (%.1f%%)\n", r1$w, r2$w, rf$w, rf$p * 100))
+cat(sprintf("\n*** 2026 PREDICTED CHAMPION: %s ***\n", rf$w))
+```
+
+
+
+
